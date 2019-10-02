@@ -1,15 +1,23 @@
-Supermatch
-================
+---
+title: "Supermatch"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
 
 ## Packages
 
-``` r
+```{r}
 pacman::p_load(tidyverse, keras, purrr)
 ```
 
+
 ## Fun
 
-``` r
+```{r}
 tokenize_seq <- function(text, tok, seq_len = 150){
   tok %>%
     keras::texts_to_sequences(texts = text) %>%
@@ -41,19 +49,15 @@ predict_score <- function(d, label1 = label1, label2 = label2){
 
 ## Model
 
-``` r
+```{r}
 model <- keras::load_model_hdf5(filepath = "models/keras_siamese_cnn_lstm_86")
 tok <- keras::load_text_tokenizer(filename = "models/tok")
 ```
 
+
 ## Prediction
 
-``` r
+```{r}
 tibble(label1 = "Bayern Muenchen", label2 = "FC Bayern München") %>%
   predict_score()
 ```
-
-    ## # A tibble: 1 x 3
-    ##   label1          label2             prob
-    ##   <chr>           <chr>             <dbl>
-    ## 1 Bayern Muenchen FC Bayern München 0.894

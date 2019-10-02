@@ -1,0 +1,441 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+## Packages
+
+```{r}
+pacman::p_load(tidyverse, purrr, keras)
+```
+
+
+## Data
+
+```{r}
+load("data/syn_data.Rdata")
+
+syn_data %>%
+  count(y, oos)
+```
+
+
+## Preprocessing
+
+```{r}
+# remotes::install_github("systats/deeplyr")
+# library(deeplyr)
+
+max_char <- 100
+seq_len <- 30
+
+tok <- keras::text_tokenizer(num_words = max_char, lower = F, filters = "", char_level = T)
+keras::fit_text_tokenizer(tok, x = syn_data$label1)
+tok$index_word
+
+keras::save_text_tokenizer(tok, file = "models/tok")
+```
+
+
+```{r}
+# prep_seq <- function(text, tok){
+#   tok %>% 
+#     keras::texts_to_sequences(texts = text) %>%
+#     keras::pad_sequences(maxlen = seq_len)
+# }
+# 
+# reshape_seq <- function(x, nrows = 30){
+#   len <- length(x)
+#   keras::array_reshape(as.matrix(x), c(len, nrows, 1)) #ncols, nframes
+# }
+
+preprocessing <- function(.x){
+  label1 <-tok %>%
+    keras::texts_to_sequences(texts = as.data.frame(.x$x)$label1) %>%
+    keras::pad_sequences(maxlen = 30)
+  
+  message("middle")
+  
+  label2 <- tok %>% 
+    keras::texts_to_sequences(texts = as.data.frame(.x$x)$label2) %>%
+    keras::pad_sequences(maxlen = 30)
+  
+  .x$x <- NULL
+  .x$x <- list(label1 = label1, label2 = label2)
+  
+  return(.x)
+}
+```
+
+
+```{r}
+sp <- deeplyr::splitter$new()
+sp$set(x = syn_data %>% select(label1, label2), y = syn_data$y, id = syn_data$oos, meta = syn_data)
+sp$split(val = T)
+
+my_splits <- sp$splits %>% map(preprocessing)
+my_splits %>% walk(glimpse)
+
+save(my_splits, file = "data/my_splits.RData")
+```
+
+
+```{r}
+load("data/my_splits.RData")
+```
+
+
+
+```{r}
+keras::use_session_with_seed(42)
+
+inp_left <- keras::layer_input(shape = seq_len)#c(seq_len, 1))
+inp_right <- keras::layer_input(shape = seq_len)# c(seq_len, 1))
+
+block_left <- inp_left %>% 
+  keras::layer_embedding(input_dim = max_char, output_dim = 8) %>%
+  keras::layer_conv_1d(filters = 128, kernel_size = 3) %>%
+  keras::layer_max_pooling_1d() %>%
+  keras::bidirectional(keras::layer_gru(units = 64)) %>%
+  keras::layer_flatten()
+
+block_right <- inp_right %>% 
+  keras::layer_embedding(input_dim = max_char, output_dim = 8) %>%
+  keras::layer_conv_1d(filters = 128, kernel_size = 3) %>%
+  keras::layer_max_pooling_1d() %>%
+  keras::bidirectional(keras::layer_gru(units = 64)) %>%
+  keras::layer_flatten()
+
+output <- keras::layer_dot(list(block_left, block_right), axes = 1) %>%
+  #keras::k_concatenate(list(block_left, block_right)) %>%
+  keras::layer_dense(units = 1, activation = "sigmoid")
+
+model <- keras::keras_model(inputs = list(inp_left, inp_right), outputs = output)
+
+model %>%
+  keras::compile(
+    optimizer = "adam",
+    loss = "binary_crossentropy",
+    metrics = "accuracy"
+  )
+
+model %>% 
+  keras::fit(
+    x = list(my_splits$train$x$label1, my_splits$train$x$label2),
+    y = my_splits$train$y,
+    epochs = 1, 
+    batch_size = 100,
+    # validation_split = .2,
+    verbose = 1,
+    validation_data = list(list(my_splits$val$x$label1, my_splits$val$x$label2), my_splits$val$y)
+  )
+
+keras::save_model_hdf5(model, filepath = "models/keras_siamese_cnn_lstm_86")
+
+options(scipen = 999)
+probs <- predict(model, list(my_splits$test$x$label1, my_splits$test$x$label2))
+
+pred <- ifelse(probs[,1] > mean(probs), 1, 0)
+
+true <- my_splits$test$y
+
+mean(true == pred)
+table(true, pred)
+
+probs[,1] %>% hist
+
+preds <- my_splits$test$meta %>% 
+  mutate(prob = predict(model, list(my_splits$test$x$label1, my_splits$test$x$label2))[,1]) %>% 
+  mutate(pred = ifelse(prob > .5, 1, 0))
+
+
+mean(preds$y == preds$pred)
+table(preds$y, preds$pred)
+
+preds %>% glimpse
+
+print(object.size(model), units = "MB")
+
+preds_train <- my_splits$train$meta[1:10000, ] %>% 
+  mutate(prob = predict(model, list(my_splits$train$x$label1[1:10000, ], my_splits$train$x$label2[1:10000, ]))[,1]) %>%
+  mutate(pred = ifelse(prob > .7, 1, 0))
+
+mean(preds_train$pred == preds_train$y)
+hist(preds_train$prob)
+
+preds %>% 
+  filter(pred != y) %>%
+  pull(prob) %>% 
+  hist
+```
+
+# Package that one
+
+
+```{r}
+tokenize_seq <- function(text, tok, seq_len = 150){
+  tok %>%
+    keras::texts_to_sequences(texts = text) %>%
+    keras::pad_sequences(maxlen = seq_len)
+}
+
+predict_labels <- function(label1, label2){
+  predict(
+    model, 
+    list(
+      label1, 
+      label2
+    )
+  )[,1]
+}
+
+predict_score <- function(d, label1 = label1, label2 = label2){
+
+  d %>% 
+    dplyr::mutate(
+      prob = list(
+        label1 = tokenize_seq({{label1}}, tok = tok, seq_len = seq_len),
+        label2 = tokenize_seq({{label2}}, tok = tok, seq_len = seq_len)
+      ) %>%
+      do.call(predict_labels, .)
+    ) 
+}
+```
+
+
+```{r}
+s1000 <- syn_data %>%
+  sample_n(1000) %>%
+  glimpse
+```
+
+
+```{r}
+f1000 <- s1000 %>%
+  predict_score() %>%
+  glimpse
+```
+
+```{r}
+tibble(label1 = "Bayern Muenchen", label2 = "FC Bayern München") %>%
+  predict_score()
+
+```
+
+
+
+
+```{r}
+predictor <- R6::R6Class("predictor",
+  private = list(
+    model = NULL,
+    tok = NULL,
+    seq_len = NULL,
+    data = NULL,
+    agg = NULL
+  ), 
+  public = list(
+    batches = NULL,
+    preds = NULL,
+    initialize = function(){
+      
+    },
+    set_backend = function(seq_len, tok, model, meta_model){
+      private$seq_len <- seq_len
+      private$tok <- tok
+      private$model <- model
+      private$meta_model <- meta_model
+    },
+    set_container = function(con){
+      private$seq_len <- con$seq_len
+      private$tok <- con$tok
+      private$model <- con$model
+      private$meta_model <- con$meta_model
+    },
+    prep_data = function(data, label1, label2, id, seq_len){
+      
+      private$data <- data
+      
+      #text_source <- quo_name(enquo(source))
+        
+      self$batches <- private$data %>% 
+        mutate(
+          mat1 = tokenize_seq(text = {{ label1 }}, tok = private$tok, seq_len = private$seq_len), 
+          mat2 = tokenize_seq(text = {{ label2 }}, tok = private$tok, seq_len = private$seq_len)
+        ) %>% 
+        dplyr::mutate(
+          prob = predict_labels({{source}}, private$model, private$tok, seq_len = private$seq_len)[,1]
+        ) 
+      
+      private$agg <- self$batches %>%
+        dplyr::select(-{{source}}) %>%
+        preprocess_batched(id = {{id}})
+    }, 
+    predict = function(){
+      
+      self$preds <- private$agg  %>%
+        dplyr::mutate(
+          prob = private$agg %>%
+            dplyr::select(n:IQR) %>% 
+            dplyr::mutate_all(as.numeric) %>% 
+            dplyr::mutate_all(~ifelse(is.na(.x), 0, .x)) %>% 
+            predict(private$meta_model, .)
+        ) 
+      
+    }
+  )
+)
+
+predict_scores <- function(data, label1, label2, container = NULL, ...){
+  
+  # p <- predictor$new()
+  # 
+  # if(!is.null(container)){
+  #   p$set_container(container)
+  # } else {
+  #   p$set_backend(...)
+  # }
+  # 
+  # p$prep_data(source = {{source}}, id = {{id}}, data = data)
+  # p$predict()
+  
+  return(p)
+}
+```
+
+
+```{r}
+con_model <- list(seq_len = 30, tok = tok, model = model)
+
+pol_user <- pol_tweets[1:100000,] %>% 
+  predict_scores(text, user_id, con_text)
+
+
+      
+
+predict_labels
+
+
+pol_user$batches
+pol_user$preds
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+load("bet365_games.Rdata")
+games_leagues %>% glimpse
+
+local_bet365 <- games_leagues$bet365_data %>% map("local_team") %>%  map(str_squish) %>% map(unique) 
+local_sportmonks <- games_leagues$sportmonks_data %>% map("sportmonks_local")  %>% map(str_squish) %>% map(unique)
+
+
+
+expand_labels<- function(.x, .y){
+  expand_grid(
+    label1 = .x,
+    label2 = .y
+  ) %>%
+    drop_na()
+}
+
+prep_labels <- function(.x){
+  
+  f1 <- tok %>%
+    keras::texts_to_sequences(texts = .x$label1) %>%
+    keras::pad_sequences(maxlen = 30)
+  
+  f2 <- tok %>% 
+    keras::texts_to_sequences(texts = .x$label2) %>%
+    keras::pad_sequences(maxlen = 30)
+  
+  return(list(label1 = .x$label1, f1 = f1, label2 = .x$label2, f2 = f2))
+}
+
+predict_labels <- function(.x){
+  
+  tibble(
+    label1 = .x$label1,
+    label2 = .x$label2,
+    prob = predict(model, list(.x$f1, .x$f2))[,1]
+  ) %>%
+    arrange(desc(prob))
+  
+}
+
+predict_labels_pos <- possibly(predict_labels, NULL)
+
+nn <- map2(local_bet365[1:2], local_sportmonks[1:2], expand_labels) %>%
+  map(prep_labels) %>%
+  map(predict_labels_pos)
+
+nn %>% 
+  glimpse
+#local_bet365 <- games_leagues$bet365_data[[1]]$visitor_team
+
+already <-tibble(label1 = NA_character_, label2 = NA_character_)
+
+nn %>% 
+  dplyr::bind_rows() %>% 
+  dplyr::select(label1, label2, prob) %>%
+  dplyr::arrange(desc(prob)) %>% 
+  mutate(string_dist = stringdist::stringdist(label1, label2)) %>%
+  split(1:nrow(.)) %>%
+  walk(~{
+    if(!.x$label1 %in% .GlobalEnv$already$label1 ){
+      if(!.x$label2 %in% .GlobalEnv$already$label2 ){
+        .GlobalEnv$already <- bind_rows(.GlobalEnv$already, .x)
+      }
+    }
+  })
+
+already %>%
+  drop_na %>%
+  arrange(-string_dist)
+
+dt %>%
+  reduce(bind_rows) %>%
+  count(sportmonks, bet365, sort = T)
+
+for(team in seq_along(unqiue(dt$prob))){
+  
+}
+```
+
+
+
+
+
+
+```{r}
+
+# library(magrittr)
+# library(abind)
+# distance_l1 <- function(tensors) { # build keras backend's function  
+#   c(x, y) %<-% tensors   
+#   return(keras::k_abs(x - y)) 
+# }       
+# 
+# layer_l1 <- keras::layer_lambda(
+#   list(block_left, block_right) , # To build self define layer, you must use layer_lamda                                
+#   f = distance_l1                              
+# )   
+# 
+# prediction  <- L1_layer%>%                
+#                layer_dense( units = 1 , activation = "sigmoid" )  
+# 
+# model       <- keras_model( list(left_input_tensor,right_input_tensor), prediction)
+```
